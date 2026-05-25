@@ -2,6 +2,7 @@ package await
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -38,6 +39,8 @@ const AWAIT_QUERY = `query AwaitPR(
           id
           isResolved
           isOutdated
+          path
+          line
           comments(first: $firstReviewComments) {
             nodes { id body author { login } createdAt }
             pageInfo { hasNextPage endCursor }
@@ -96,7 +99,7 @@ type PullRequest struct {
 	ReviewThreads ThreadNodes  `json:"reviewThreads"`
 	Mergeable     string       `json:"mergeable"`
 	MergeState    string       `json:"mergeStateStatus"`
-	Commits       CommitNodes   `json:"commits"`
+	Commits       CommitNodes  `json:"commits"`
 }
 
 type CommentNodes struct {
@@ -127,6 +130,8 @@ type ReviewThread struct {
 	ID          string         `json:"id"`
 	IsResolved  bool           `json:"isResolved"`
 	IsOutdated  bool           `json:"isOutdated"`
+	Path        string         `json:"path"`
+	Line        *int           `json:"line"`
 	Comments    ReviewComments `json:"comments"`
 }
 
@@ -169,9 +174,9 @@ type RunNodes struct {
 }
 
 type CheckRun struct {
-	Name        string         `json:"name"`
-	Conclusion  string         `json:"conclusion"`
-	Status      string         `json:"status"`
+	Name        string          `json:"name"`
+	Conclusion  string          `json:"conclusion"`
+	Status      string          `json:"status"`
 	Annotations AnnotationNodes `json:"annotations"`
 }
 
@@ -191,20 +196,30 @@ type AnnotationNodes struct {
 	TotalCount int               `json:"totalCount"`
 }
 
+// ThreadSummary provides an actionable summary of a review thread,
+// giving agents enough context to take action without additional API calls.
+type ThreadSummary struct {
+	ID         string `json:"id"`
+	Path       string `json:"path,omitempty"`
+	Line       *int   `json:"line,omitempty"`
+	IsResolved bool   `json:"is_resolved"`
+	IsOutdated bool   `json:"is_outdated"`
+}
+
 // Fetch retrieves PR data for polling.
 func (s *Service) Fetch(identity *resolver.Identity, number int) (*QueryResponse, error) {
 	var result QueryResponse
 	owner := identity.Owner
 	repo := identity.Repo
 	err := s.API.GraphQL(AWAIT_QUERY, map[string]interface{}{
-		"owner":              owner,
-		"repo":               repo,
-		"number":             number,
-		"firstComments":      100,
-		"firstThreads":       100,
+		"owner":               owner,
+		"repo":                repo,
+		"number":              number,
+		"firstComments":       100,
+		"firstThreads":        100,
 		"firstReviewComments": 100,
-		"firstCheckSuites":   100,
-		"firstChecks":        100,
+		"firstCheckSuites":    100,
+		"firstChecks":         100,
 	}, &result)
 	if err != nil {
 		return nil, err
@@ -330,6 +345,9 @@ func Conditions(pr *PullRequest, mode Mode) []string {
 		if CountUnresolvedThreads(pr) > 0 {
 			conditions = append(conditions, "unresolved-threads")
 		}
+		if len(pr.Comments.Nodes) > 0 {
+			conditions = append(conditions, "new-comments")
+		}
 	}
 
 	if mode == ModeAll || mode == ModeConflicts {
@@ -345,6 +363,21 @@ func Conditions(pr *PullRequest, mode Mode) []string {
 	}
 
 	return conditions
+}
+
+// ThreadSummaries returns actionable summaries of all review threads.
+func ThreadSummaries(pr *PullRequest) []ThreadSummary {
+	summaries := make([]ThreadSummary, 0, len(pr.ReviewThreads.Nodes))
+	for _, t := range pr.ReviewThreads.Nodes {
+		summaries = append(summaries, ThreadSummary{
+			ID:         t.ID,
+			Path:       t.Path,
+			Line:       t.Line,
+			IsResolved: t.IsResolved,
+			IsOutdated: t.IsOutdated,
+		})
+	}
+	return summaries
 }
 
 // SecondsToHuman converts seconds to human-readable string.
@@ -393,17 +426,42 @@ func FailingAnnotations(pr *PullRequest) []CheckAnnotation {
 }
 
 // Result represents the await polling result for JSON output.
+// All slice fields are normalized to empty arrays (never null) so that
+// downstream JSON consumers (including agent notification injection systems)
+// receive consistent, parseable arrays rather than null.
 type Result struct {
-	Conditions []string         `json:"conditions,omitempty"`
-	Unresolved int              `json:"unresolved_threads"`
-	General    int              `json:"general_comments"`
-	Conflicts  bool             `json:"has_conflicts"`
-	Failing    []string         `json:"failing_checks"`
-	Pending    []string         `json:"pending_checks"`
+	Conditions  []string          `json:"conditions"`
+	Unresolved int               `json:"unresolved_threads"`
+	General    int               `json:"general_comments"`
+	Conflicts  bool              `json:"has_conflicts"`
+	Failing    []string          `json:"failing_checks"`
+	Pending    []string          `json:"pending_checks"`
 	Annotations []CheckAnnotation `json:"annotations,omitempty"`
-	TimedOut   bool             `json:"timed_out"`
-	Cancelled  bool             `json:"cancelled"`
-	WatchedMs  int64            `json:"watched_ms"`
+	Threads    []ThreadSummary   `json:"threads"`
+	TimedOut   bool              `json:"timed_out"`
+	Cancelled  bool              `json:"cancelled"`
+	WatchedMs  int64             `json:"watched_ms"`
+}
+
+// MarshalJSON ensures nil slices produce [] instead of null in JSON output.
+// Without this, Go's default serialization writes null for nil slices,
+// which breaks downstream JSON consumers that expect arrays.
+func (r *Result) MarshalJSON() ([]byte, error) {
+	type Alias Result
+	tmp := Alias(*r)
+	if tmp.Conditions == nil {
+		tmp.Conditions = []string{}
+	}
+	if tmp.Failing == nil {
+		tmp.Failing = []string{}
+	}
+	if tmp.Pending == nil {
+		tmp.Pending = []string{}
+	}
+	if tmp.Threads == nil {
+		tmp.Threads = []ThreadSummary{}
+	}
+	return json.Marshal(tmp)
 }
 
 // WatchOptions configures the watch behavior.
@@ -492,14 +550,36 @@ func (s *Service) Watch(ctx context.Context, identity *resolver.Identity, opts W
 }
 
 func buildResult(pr *PullRequest, conditions []string, timedOut, cancelled bool, startTime time.Time) *Result {
+	failing := FailingChecks(pr)
+	if failing == nil {
+		failing = []string{}
+	}
+	pending := PendingChecks(pr)
+	if pending == nil {
+		pending = []string{}
+	}
+	annotations := FailingAnnotations(pr)
+	if annotations == nil {
+		annotations = []CheckAnnotation{}
+	}
+	threads := ThreadSummaries(pr)
+	if threads == nil {
+		threads = []ThreadSummary{}
+	}
+	conditionsNormalized := conditions
+	if conditionsNormalized == nil {
+		conditionsNormalized = []string{}
+	}
+
 	return &Result{
-		Conditions:  conditions,
+		Conditions:  conditionsNormalized,
 		Unresolved: CountUnresolvedThreads(pr),
 		General:    len(pr.Comments.Nodes),
 		Conflicts:  HasConflicts(pr),
-		Failing:    FailingChecks(pr),
-		Pending:    PendingChecks(pr),
-		Annotations: FailingAnnotations(pr),
+		Failing:    failing,
+		Pending:    pending,
+		Annotations: annotations,
+		Threads:    threads,
 		TimedOut:   timedOut,
 		Cancelled:  cancelled,
 		WatchedMs:  time.Since(startTime).Milliseconds(),

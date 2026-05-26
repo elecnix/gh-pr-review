@@ -1,10 +1,22 @@
 package await
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+// commentAuthor creates an Author value matching Comment.Author's type.
+func commentAuthor(login string) struct {
+	Login string `json:"login"`
+} {
+	return struct {
+		Login string `json:"login"`
+	}{Login: login}
+}
 
 func TestCountUnresolvedThreads(t *testing.T) {
 	tests := []struct {
@@ -56,7 +68,7 @@ func TestCountUnresolvedThreads(t *testing.T) {
 
 func TestHasConflicts(t *testing.T) {
 	tests := []struct {
-		name      string
+		name       string
 		mergeable string
 		expected  bool
 	}{
@@ -583,5 +595,146 @@ func TestFailingAnnotations(t *testing.T) {
 		assert.Len(t, annotations, 1)
 		assert.Nil(t, annotations[0].StartLine)
 		assert.Nil(t, annotations[0].EndLine)
+	})
+}
+
+// ===== Regression tests: agent notification gaps =====
+
+func TestConditions_Regression_GeneralComments(t *testing.T) {
+	// General comments were never flagged as conditions, so agents monitoring
+	// a PR would not be notified when someone posts a general comment.
+	t.Run("general comments detected in all mode", func(t *testing.T) {
+		pr := &PullRequest{
+			Mergeable: "MERGEABLE",
+			Comments: CommentNodes{
+				Nodes: []Comment{
+					{ID: "C_1", Body: "Please review this PR", Author: commentAuthor("alice"), CreatedAt: "2024-01-01T00:00:00Z"},
+				},
+			},
+		}
+		conds := Conditions(pr, ModeAll)
+		assert.Contains(t, conds, "new-comments")
+	})
+
+	t.Run("general comments detected in comments mode", func(t *testing.T) {
+		pr := &PullRequest{
+			Mergeable: "MERGEABLE",
+			Comments: CommentNodes{
+				Nodes: []Comment{
+					{ID: "C_1", Body: "LGTM", Author: commentAuthor("bob"), CreatedAt: "2024-01-01T00:00:00Z"},
+				},
+			},
+		}
+		conds := Conditions(pr, ModeComments)
+		assert.Contains(t, conds, "new-comments")
+	})
+
+	t.Run("no condition when zero general comments", func(t *testing.T) {
+		pr := &PullRequest{Mergeable: "MERGEABLE"}
+		conds := Conditions(pr, ModeComments)
+		assert.NotContains(t, conds, "new-comments")
+	})
+
+	t.Run("general comments not flagged in actions-only mode", func(t *testing.T) {
+		pr := &PullRequest{
+			Mergeable: "MERGEABLE",
+			Comments: CommentNodes{
+				Nodes: []Comment{
+					{ID: "C_1", Body: "hello", Author: commentAuthor("bob"), CreatedAt: "2024-01-01T00:00:00Z"},
+				},
+			},
+		}
+		conds := Conditions(pr, ModeActions)
+		assert.NotContains(t, conds, "new-comments")
+	})
+}
+
+func TestThreadSummaries(t *testing.T) {
+	// Thread summaries give agents actionable detail (id, path, line) without
+	// needing an additional API call.
+	t.Run("thread summary includes path and line", func(t *testing.T) {
+		line42 := 42
+		pr := &PullRequest{
+			Mergeable: "MERGEABLE",
+			ReviewThreads: ThreadNodes{
+				Nodes: []ReviewThread{
+					{
+						ID:         "PRRT_1",
+						IsResolved: false,
+						IsOutdated: false,
+						Path:       "src/main.go",
+						Line:       &line42,
+						Comments: ReviewComments{
+							Nodes: []Comment{
+								{ID: "C_1", Body: "Fix this", Author: commentAuthor("reviewer"), CreatedAt: "2024-01-01T00:00:00Z"},
+							},
+						},
+					},
+				},
+			},
+		}
+		summaries := ThreadSummaries(pr)
+		require.Len(t, summaries, 1)
+		assert.Equal(t, "PRRT_1", summaries[0].ID)
+		assert.Equal(t, "src/main.go", summaries[0].Path)
+		assert.Equal(t, 42, *summaries[0].Line)
+		assert.False(t, summaries[0].IsResolved)
+	})
+
+	t.Run("empty threads returns empty slice", func(t *testing.T) {
+		pr := &PullRequest{Mergeable: "MERGEABLE"}
+		summaries := ThreadSummaries(pr)
+		assert.Empty(t, summaries)
+	})
+}
+
+func TestBuildResult_JsonEncoding(t *testing.T) {
+	// Regression: nil Go slices serialize to JSON null instead of [].
+	// This breaks JSON consumers (like agent notification injectors) that
+	// expect arrays. All slice fields must produce [] when empty.
+	t.Run("nil slices produce empty arrays not null", func(t *testing.T) {
+		result := &Result{
+			Conditions: nil,
+			Failing:    nil,
+			Pending:    nil,
+			Threads:    nil,
+		}
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"conditions":[]`, "conditions should be [] not null/omitted")
+		assert.Contains(t, string(data), `"failing_checks":[]`, "failing_checks should be [] not null")
+		assert.Contains(t, string(data), `"pending_checks":[]`, "pending_checks should be [] not null")
+		assert.Contains(t, string(data), `"threads":[]`, "threads should be [] not null")
+	})
+
+	t.Run("thread summaries included in buildResult", func(t *testing.T) {
+		line10 := 10
+		pr := &PullRequest{
+			Mergeable: "MERGEABLE",
+			ReviewThreads: ThreadNodes{
+				Nodes: []ReviewThread{
+					{
+						ID:         "PRRT_1",
+						IsResolved: false,
+						IsOutdated: false,
+						Path:       "src/app.go",
+						Line:       &line10,
+						Comments:   ReviewComments{Nodes: []Comment{}},
+					},
+				},
+			},
+		}
+		result := buildResult(pr, []string{"unresolved-threads"}, false, false, time.Time{})
+		require.Len(t, result.Threads, 1)
+		assert.Equal(t, "PRRT_1", result.Threads[0].ID)
+		assert.Equal(t, "src/app.go", result.Threads[0].Path)
+	})
+
+	t.Run("conditions always present in JSON even when empty", func(t *testing.T) {
+		result := buildResult(&PullRequest{Mergeable: "MERGEABLE"}, []string{}, false, false, time.Time{})
+		// conditions should be [] not omitted
+		data, err := json.Marshal(result)
+		require.NoError(t, err)
+		assert.Contains(t, string(data), `"conditions":[]`)
 	})
 }

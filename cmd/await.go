@@ -150,6 +150,7 @@ func runCheckOnly(cmd *cobra.Command, service *await.Service, identity *resolver
 		Failing:     await.FailingChecks(pr),
 		Pending:     await.PendingChecks(pr),
 		Annotations: await.FailingAnnotations(pr),
+		Threads:     await.ThreadSummaries(pr),
 		TimedOut:    false,
 		Cancelled:   false,
 		WatchedMs:   0,
